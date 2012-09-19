@@ -166,54 +166,56 @@ class HexdumpServerProtocol(Protocol):
   @coroutine 
   def process_incoming_data(self):
     message = ""
-    while True:
-      message = message + (yield)
-      if(len(message) >= 7):
-        (header, v, a, i) = unpack_from('4sbbb', message[0:7])
-        logger.debug("Header decoded: %s %d %d %d" % (header, v, a, i))
-        message = message[7:]
-        while True:
-          if(len(message) >= 4):
-            size = unpack(">I", message[0:4])
-            message = message[4:]
-            while True:
-              if(len(message) >= size[0]): 
-                 ipcconn = IpcConnectionContext_pb2.IpcConnectionContextProto()
-                 ipcconn.ParseFromString(message[0:size[0]])
-                 logger.info("Logging a connection:\n%s" % (str(ipcconn)))
-                 message = message[size[0]:]
+    # First, get some data, and kick it back to the outer routine until we get something
+    message = message + (yield)
 
-                 while True:
-                   if(len(message) >= 4):
-                     size = unpack(">I", message[0:4])
-                     #message = message[4:]
-                     while True:
-                       if(len(message) >= size[0]): 
-                         rpchead = RpcPayloadHeader_pb2.RpcPayloadHeaderProto()
-                         (headersize, headerposition) = decoder._DecodeVarint(message[4:],0)
-                         rpchead.ParseFromString(message[4+headerposition:4+headerposition+headersize])
-                         message = message[4+headerposition+headersize:]
-                         (bodysize, bodyposition) = decoder._DecodeVarint(message[0:],0)
-                         rpcreq = hadoop_rpc_pb2.HadoopRpcRequestProto()
-                         rpcreq.ParseFromString(message[bodyposition:bodyposition+bodysize])
-                         logger.info("The Request is for %s" % (rpcreq.methodName))
-                         self.messages[rpchead.callId] = {"time": time.time(), "method": rpcreq.methodName}
-                         message = ""
-                       else:
-                         message = message + (yield)
-                   else:
-                     message = message + (yield)
-                  # End of the RpcReq Processing
+    # The first part of the connection will be a 7 byte header identifying this as a Hadoop
+    # data stream. Verify that. (well, pretend to verify that)
+    while(len(message) < 7):
+      message = message + (yield)  
+    (header, v, a, i) = unpack_from('4sbbb', message[0:7])
+    logger.debug("Header decoded: %s %d %d %d" % (header, v, a, i))
+    message = message[7:]
 
-              else:
-                message = message + (yield)
-              # End of waiting for data for IPC Header
+    # Next, we need at least 4 bytes to give us a notion of how much more to read
+    while(len(message) < 4):
+      message = message + (yield)  
+    size = unpack(">I", message[0:4])
+    message = message[4:]
 
-          else:
-            message = message + (yield) 
-           # End of waiting for enough data for the initial header
+    # Now we know how much we need to read for the header
+    
+    while(len(message) < size[0]):
+      message = message + (yield) 
+    ipcconn = IpcConnectionContext_pb2.IpcConnectionContextProto()
+    ipcconn.ParseFromString(message[0:size[0]])
+    logger.info("Logging a connection:\n%s" % (str(ipcconn)))
+    message = message[size[0]:]
 
-     # self.messageCount += 1
+    # From here on out, we'll be in an infinite loop, reading RPC Requests
+    while True:   
+      while(len(message) < 4):
+        message = message + (yield)
+      size = unpack(">I", message[0:4]) 
+      logger.debug("Waiting for at least %d for next RPC" % (size[0]))
+      message = message[4:]
+      while(len(message) < size[0]):
+        message = message +(yield)
+
+      # OK, we've got enough for this message, let's decode it
+      rpchead = RpcPayloadHeader_pb2.RpcPayloadHeaderProto()
+      (headersize, headerposition) = decoder._DecodeVarint(message,0)
+      rpchead.ParseFromString(message[headerposition:headerposition+headersize])
+      message = message[headerposition+headersize:]
+      (bodysize, bodyposition) = decoder._DecodeVarint(message,0)
+      rpcreq = hadoop_rpc_pb2.HadoopRpcRequestProto()
+      rpcreq.ParseFromString(message[bodyposition:bodyposition+bodysize])
+
+      # Stash some information about this reqest so we can look it up on the flipside
+      logger.info("The Request is for callid %s, %s" % (str(rpchead.callId), rpcreq.methodName))
+      self.messages[rpchead.callId] = {"time": time.time(), "method": rpcreq.methodName}
+      message = message[size[0]:]
+
 
   @coroutine
   def process_outgoing_data(self):
@@ -242,9 +244,13 @@ class HexdumpServerProtocol(Protocol):
           resp = RpcPayloadHeader_pb2.RpcResponseHeaderProto()
           #logger.info("We've got %d bytes, decoding a message of %d starting at %d" % (len(message), msgsize, msgstart))
           resp.ParseFromString(message[msgstart:msgstart+msgsize])
+          logger.debug("Extracting info for %s from messages, which is\n%s" % (str(resp.callId), str(self.messages))) 
           elapsed = time.time() - self.messages[resp.callId]["time"]
           if resp.status == 0:
             logger.info("Success for RPC %d (%s) - took %.4f seconds" % (resp.callId, self.messages[resp.callId]["method"], elapsed))
+          if self.messages[resp.callId]:
+            del self.messages[resp.callId]
+
           message = message[msgsize+msgstart:]
 
           while True:
