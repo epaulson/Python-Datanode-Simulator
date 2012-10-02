@@ -216,15 +216,17 @@ class HexdumpServerProtocol(Protocol):
       self.messages[rpchead.callId] = {"time": time.time(), "method": rpcreq.methodName}
       message = message[size[0]:]
 
-
   @coroutine
   def process_outgoing_data(self):
     message = ""
+
     while True:
+      
+      # First, loop until we've got the first integer with header length
       position = 0
       while True:
-        message = message + (yield)
         if position == len(message):
+          message = message + (yield)
           next
         b = ord(message[position])
         position += 1
@@ -235,43 +237,63 @@ class HexdumpServerProtocol(Protocol):
       # we don't have to flip back to the other function to get more data
       (msgsize, msgstart) = decoder._DecodeVarint(message, 0)  
       
-      # FIXME - this didn't work, figure out what went wrong
-      #message = message[msgstart:]
-
       # Keep looping until we've got enough data to decode the RPC results
-      while True:
-        if(len(message) >= msgsize-msgstart):
-          resp = RpcPayloadHeader_pb2.RpcResponseHeaderProto()
-          #logger.info("We've got %d bytes, decoding a message of %d starting at %d" % (len(message), msgsize, msgstart))
-          resp.ParseFromString(message[msgstart:msgstart+msgsize])
-          logger.debug("Extracting info for %s from messages, which is\n%s" % (str(resp.callId), str(self.messages))) 
-          elapsed = time.time() - self.messages[resp.callId]["time"]
-          if resp.status == 0:
-            logger.info("Success for RPC %d (%s) - took %.4f seconds" % (resp.callId, self.messages[resp.callId]["method"], elapsed))
-          if self.messages[resp.callId]:
-            del self.messages[resp.callId]
+      while(len(message)-msgstart < msgsize):
+        message = message + (yield)
+      resp = RpcPayloadHeader_pb2.RpcResponseHeaderProto()
+      resp.ParseFromString(message[msgstart:msgstart+msgsize])
+      message = message[msgsize+msgstart:]
 
-          message = message[msgsize+msgstart:]
+      logger.debug("Extracting info for %s from messages, which is\n%s" % (str(resp.callId), str(self.messages))) 
+      elapsed = time.time() - self.messages[resp.callId]["time"]
 
-          while True:
-            if(len(message) >= 4):
-              remaining = unpack(">I", message[0:4])
-              message = message[4:]
-              while True:
-                if(len(message) >= remaining[0]):
-                  logger.debug("Read all of the response bytes, but don't really care what it is")
-                  message = message[remaining[0]:]
-                  break
-                else:
-                  logger.debug("Reading more data for full response, have %d, waiting for %d" % (len(message), remaining[0]))
-                  message = message + (yield)
-              break
-            else:
-              logger.debug("Reading more data for length of full response")
-              message = message + (yield)
-          break
-        else:
+      if resp.status == 0:
+        logger.info("Success for RPC %d (%s) - took %.4f seconds" % (resp.callId, self.messages[resp.callId]["method"], elapsed))
+
+        while(len(message) < 4):
           message = message + (yield)
+        remaining = unpack(">I", message[0:4])
+        message = message[4:]
+
+        while(len(message) < remaining[0]):
+           message = message + (yield)
+        logger.debug("Read all of the response bytes, but don't really care what it is")
+        message = message[remaining[0]:]
+
+      else: # resp.status != 0 
+        logger.debug("Status for RPC %d (%s) was %d, discarding results" % (resp.callId, self.messages[resp.callId]["method"], reps.status))
+
+        # In an error, there are two response strings, each prefixed with 4 byte integers
+        # TODO - RpcPayloadHeader.proto says "In case of Fatal error then the respose contains the Serverside's IPC version"
+        while(len(message) < 4):
+          message = message + (yield)
+        remaining = unpack(">I", message[0:4])
+        message = message[4:]
+ 
+        if(remaining[0] > 0):
+          while(len(message) < remaining[0]):
+             message = message + (yield)
+          logger.debug("RPC Failure class: %s" % (str(message[0:remaining[0]])))
+          message = message[remaining[0]:]
+        else:
+          logger.debug("RPC Failure: Unknown Class")
+
+        # Next up, stack trace
+        while(len(message) < 4):
+          message = message + (yield)
+        remaining = unpack(">I", message[0:4])
+        message = message[4:]
+ 
+        if(remaining[0] > 0):
+          while(len(message) < remaining[0]):
+             message = message + (yield)
+          logger.debug("RPC Failure Stack Trace:\n%s" % (str(message[0:remaining[0]])))
+          message = message[remaining[0]:]
+        else:
+          logger.debug("RPC Failure: No Stack Trace follows")
+ 
+      if self.messages[resp.callId]:
+        del self.messages[resp.callId]
 
   def __init__(self, serverFactory):
     self.factory=serverFactory
